@@ -9,7 +9,7 @@ on:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 60   # 单次最多跑 60 分钟，防止卡死
+    timeout-minutes: 20   # 单次最多跑 60 分钟，防止卡死
 
     steps:
       - name: 拉取仓库代码
@@ -24,7 +24,7 @@ jobs:
         run: pip install "ccxt>=4.5.76"
 
       - name: 运行采集脚本
-        run: python collect_poly_15m.py --run-for 600 --out poly_data
+        run: python collect_poly_15m.py --run-for 840 --out poly_data
 
       - name: 把数据提交回仓库
         run: |
