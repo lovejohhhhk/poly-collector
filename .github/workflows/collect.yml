@@ -24,7 +24,7 @@ jobs:
         run: pip install "ccxt>=4.5.76"
 
       - name: 运行采集脚本
-        run: python collect_poly_15m.py --run-for 3300 --out poly_data
+        run: python collect_poly_15m.py --run-for 600 --out poly_data
 
       - name: 把数据提交回仓库
         run: |
