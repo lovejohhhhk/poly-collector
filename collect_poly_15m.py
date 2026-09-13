@@ -64,6 +64,7 @@ CORS 中转前缀（会拼 URL + 补 Origin 头），且在 ccxt 4.5.76 里必�
     err       单次请求失败（统计中转可用率，决定要不要自建反代）
 """
 
+
 import argparse
 import asyncio
 import collections
@@ -77,37 +78,29 @@ import sys
 import time
 
 # ============================== 配置区 ==============================
-# 代理优先级：--proxy（显式，空串=直连）> $POLY_PROXY > $HTTPS_PROXY/$https_proxy > 平台默认 > 直连
-#   Windows 平台默认走本机 clash.meta mixed-port；Linux/宝塔默认直连（墙外 VPS 最省事）
 PROXY_DEFAULT_WIN = "http://127.0.0.1:7890"
 PROXY_ENV_KEYS = ("POLY_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 COINS_DEFAULT = [c.strip().upper() for c in os.environ.get("POLY_COINS", "BTC,ETH").split(",")
-                 if c.strip()]        # 与 checkpoint/_binary_combo_futures_test.json 的 4 方案一致
-WINDOW_SECONDS = 900                  # 15min 窗口 = 900s，ts 对齐到 900 整数倍
-POLL_SECONDS = 20                     # 常态采样间隔
-POLL_SECONDS_BURST = 10               # 窗口开盘后 BURST_SECONDS 内加密（信号触发点）
+                 if c.strip()]
+WINDOW_SECONDS = 900
+POLL_SECONDS = 20
+POLL_SECONDS_BURST = 10
 BURST_SECONDS = 90
-MIN_REQUEST_GAP_S = 1.0               # 任意两次 HTTP 之间的最小间隔（全局限速）
-TIMEOUT_MS = 25000                    # 单请求超时（本机代理 RTT 实测 1~3s，留足余量）
-MAX_RETRIES = 4                       # 单请求重试次数
-BACKOFF_BASE_S = 1.5                  # 重试退避基数：1.5s × 第几次
-SETTLE_RETRY_S = 30                   # 结算结果重试间隔
-MAX_SETTLE_ATTEMPTS = 40              # 结算最多重试次数（~20 分钟；UMA 解析实测约 10min 才落定）
-MARKET_RESOLVE_RETRY_S = 30           # 未解析时重试解析的间隔（gamma 索引延迟 / 中途重启）
+MIN_REQUEST_GAP_S = 1.0
+TIMEOUT_MS = 25000
+MAX_RETRIES = 4
+BACKOFF_BASE_S = 1.5
+SETTLE_RETRY_S = 30                   # 退避基数（第 0 次尝试后等 30s）
+MAX_SETTLE_ATTEMPTS = 100             # 提到 100，配合退避覆盖 1~2 小时
+SETTLE_BACKOFF_MAX_S = 600            # 退避上限 10 分钟
+MARKET_RESOLVE_RETRY_S = 30
 Q_MAX_LIST = [(0.5214, "main"), (0.5314, "sleeve"), (0.5308, "long"), (0.5329, "short")]
-# 深度曲线必须包含 q_max 的精确档位，否则 report 里 ask_depth[str(q)] 取不到键
-# （曾经 DEPTH_THRESHOLDS 只有 0.52/0.53 -> 查 0.5214 恒为 None -> 误判「两侧均未触及」）
 DEPTH_THRESHOLDS = sorted(set([0.40, 0.45, 0.47, 0.50, 0.52, 0.53, 0.55, 0.60, 0.70, 0.80, 0.90]
                               + [q for q, _ in Q_MAX_LIST]))
-MIN_FILL_SHARES = 50                  # go/no-go：<=q_max 一侧至少能吃到多少股
-FEE_RATE_MAX = 0.25                   # Polymarket taker 公式里的 feeRate 上限
-STATUS_PRINT_S = 300                  # 状态行间隔
-
-# 手续费口径（Polymarket 官方 taker 公式）：
-#   fee = 股数 × p × feeRate × (p(1-p))^2，feeRate 上限 0.25
-#   p=0.50 时 = 股数 × 0.0078125 -> 每股 0.78¢ = 1.56%（50¢ 处封顶有效费率）
-#   15min 市场走 CLOB 的 base_fee（bps），实际以 /fee-rate 返回为准
-# ==================================================================
+MIN_FILL_SHARES = 50
+FEE_RATE_MAX = 0.25
+STATUS_PRINT_S = 300
+TAIL_SETTLE_WAIT_S = 60               # 停止时，等尾窗结束 + 60s 再退出
 
 OUT_DIR = os.environ.get("POLY_OUT") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "poly_data")
@@ -115,18 +108,16 @@ SLUG_PREFIX = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp",
                "DOGE": "doge", "BNB": "bnb", "ADA": "ada", "APT": "apt",
                "ARB": "arb", "AVAX": "avax"}
 
-STOP = False          # SIGTERM/SIGINT 置位后主循环收尾退出（宝塔停服走这条路径）
+STOP = False
 
 
-# ------------------------------ 工具 ------------------------------
 def now_ms():
     return int(time.time() * 1000)
 
 
 def resolve_proxy(cli_proxy):
-    """--proxy 显式 > 环境变量 > 平台默认（Windows 走本机 clash，Linux 直连）。"""
     if cli_proxy is not None:
-        return cli_proxy.strip() or None      # 空串 = 显式直连
+        return cli_proxy.strip() or None
     for k in PROXY_ENV_KEYS:
         v = (os.environ.get(k) or "").strip()
         if v:
@@ -135,7 +126,6 @@ def resolve_proxy(cli_proxy):
 
 
 def install_signal_handlers():
-    """宝塔/进程守护停服发 SIGTERM；SIGHUP（终端断开）也当停止处理。"""
     def _handler(signum, _frame):
         global STOP
         if not STOP:
@@ -192,15 +182,12 @@ def fnum(v, d=None):
 
 
 def depth_curve(levels, thresholds, mode):
-    """levels: [(price, size)]；mode='ask' 累计 price<=thr，'bid' 累计 price>=thr。
-    注意 Polymarket /book 返回的 bids/asks 都是「离中间价远的在前、最优价在最后」，
-    这里一律先排序成「最优价在前」再累计。"""
     if mode == "ask":
-        lv = sorted(levels, key=lambda x: x[0])          # 升序，最优 ask 最前
+        lv = sorted(levels, key=lambda x: x[0])
         thr = sorted(thresholds)
         key_fn = lambda p, t: p <= t + 1e-12
     else:
-        lv = sorted(levels, key=lambda x: -x[0])         # 降序，最优 bid 最前
+        lv = sorted(levels, key=lambda x: -x[0])
         thr = sorted(thresholds, reverse=True)
         key_fn = lambda p, t: p >= t - 1e-12
     out, cum, i = {}, 0.0, 0
@@ -213,9 +200,6 @@ def depth_curve(levels, thresholds, mode):
 
 
 def _levels(raw, side):
-    """返回「最优价在前」的 [(price, size)]。
-    Polymarket /book 的 bids/asks 都是「离中间价远的在前、最优价在最后」
-    （bids 升序到 0.51、asks 降序到 0.52），直接用 [0] 会取到最差价 0.01/0.99。"""
     lv = []
     for x in (raw.get(side) or []):
         p, s = fnum(x.get("price")), fnum(x.get("size"))
@@ -239,23 +223,21 @@ def med(vals):
     return statistics.median(vals) if vals else None
 
 
-# ------------------------------ 采集器 ------------------------------
 class Collector:
     def __init__(self, ex, args):
         self.ex = ex
         self.args = args
         self.coins = args.coins
-        self.windows = {}       # (coin, ts) -> 窗口状态
-        self.pending = {}       # (coin, ts) -> 待结算
+        self.windows = {}
+        self.pending = {}
         self.last_req = 0.0
-        self.recent = collections.deque(maxlen=20)   # 最近 20 次请求成败
-        self.slow = 1.0                               # 自适应降频倍数
+        self.recent = collections.deque(maxlen=20)
+        self.slow = 1.0
         self.last_settle_check = 0.0
         self.last_print = 0.0
         self.n_ok = self.n_err = 0
         self.t_start = time.time()
 
-    # ---- HTTP（统一限速 + 重试 + 失败计数） ----
     async def _call(self, method, params, where, coin=None, ts=None):
         fn = getattr(self.ex, method)
         last = None
@@ -299,7 +281,6 @@ class Collector:
 
     async def _gamma_market(self, slug, coin, ts, closed=None):
         params = {"slug": slug, "limit": 2}
-        # gamma 默认只返回未收盘市场：查已收盘窗口必须显式带 closed=true（实测已验证）
         if closed is not None:
             params["closed"] = "true" if closed else "false"
         if self.args.bust_cache:
@@ -311,7 +292,6 @@ class Collector:
                 return m
         return rows[0] if rows else None
 
-    # ---- 窗口解析 ----
     async def resolve(self, w):
         coin, ts = w["coin"], w["ts"]
         ts_ms = now_ms()
@@ -342,7 +322,6 @@ class Collector:
         w["resolved"] = True
         w["tick_size"] = fnum(m.get("orderPriceMinTickSize"), 0.01)
         w["min_size"] = fnum(m.get("orderMinSize"), 1.0)
-        # 手续费：一次窗口一次（base_fee 单位 bps）
         fee_bps, fee_raw = None, None
         try:
             fee_raw = await self._call("clobPublicGetFeeRate", {"token_id": ids["UP"]}, "clob/fee-rate", coin, ts)
@@ -364,7 +343,6 @@ class Collector:
             "gamma_spread": fnum(m.get("spread")), "uma": m.get("umaResolutionStatus"),
         })
 
-    # ---- 盘口采样 ----
     async def _book(self, w, tag):
         params = {"token_id": w["token_ids"][tag]}
         if self.args.bust_cache:
@@ -417,9 +395,9 @@ class Collector:
                 "last_sample_ms": w.get("last_ms"),
                 "up_mid_range": w.get("up_mid_range"), "down_mid_range": w.get("down_mid_range"),
                 "resolve_fails": w.get("resolve_fails")})
-        self.pending[(w["coin"], w["ts"])] = {"slug": w["slug"], "attempts": 0}
+        # 改动 4：加 last_try，配合指数退避
+        self.pending[(w["coin"], w["ts"])] = {"slug": w["slug"], "attempts": 0, "last_try": 0.0}
 
-    # ---- 结算 ----
     async def try_settle(self, coin, ts, st):
         try:
             m = await self._gamma_market(st["slug"], coin, ts, closed=True)
@@ -437,7 +415,7 @@ class Collector:
         if decisive is None and not closed:
             return False
         if decisive is None:
-            return False    # closed 但价格未落定（UMA 未解析），继续等
+            return False
         win_label = labels[decisive] if decisive < len(labels) else str(decisive)
         write_row(coin, ts, {
             "kind": "settle", "ts_ms": now_ms(), "coin": coin, "slug": st["slug"],
@@ -447,7 +425,6 @@ class Collector:
             "up_won": win_label in ("up", "yes")})
         return True
 
-    # ---- 主循环 ----
     async def loop(self):
         print(f"[collector] proxy={'direct' if not self.args.proxy else self.args.proxy} "
               f"coins={self.coins} poll={POLL_SECONDS}s out={OUT_DIR}", flush=True)
@@ -462,10 +439,8 @@ class Collector:
             t0 = time.time()
             ts = int(time.time()) // WINDOW_SECONDS * WINDOW_SECONDS
             try:
-                # 1) 滚动窗口：过期 -> 收尾 + 排队结算
                 for w in [x for x in self.windows.values() if x["ts"] + WINDOW_SECONDS <= time.time()]:
                     self.finalize(w)
-                # 2) 解析当前窗口的市场（gamma 索引有延迟，只在开盘后 180s 内重试）
                 for coin in self.coins:
                     key = (coin, ts)
                     w = self.windows.get(key)
@@ -474,31 +449,34 @@ class Collector:
                                                  "resolved": False, "resolve_fails": 0,
                                                  "n_samples": 0, "last_ms": None,
                                                  "last_resolve_ms": 0}
-                    # 窗口内持续尝试解析（重试节流），开盘时 gamma 索引可能还没跟上
                     if (not w["resolved"]
                             and ts + WINDOW_SECONDS - time.time() > 60
                             and now_ms() - w["last_resolve_ms"] > MARKET_RESOLVE_RETRY_S * 1000):
                         w["last_resolve_ms"] = now_ms()
                         await self.resolve(w)
-                # 3) 采样
                 for coin in self.coins:
                     w = self.windows.get((coin, ts))
                     if w and w["resolved"]:
                         await self.sample(w)
-                # 4) 结算重试
-                if time.time() - self.last_settle_check > SETTLE_RETRY_S:
-                    self.last_settle_check = time.time()
-                    for (coin, wts), st in list(self.pending.items()):
-                        if await self.try_settle(coin, wts, st):
+
+                # 改动 2：结算指数退避
+                now_t = time.time()
+                for (coin, wts), st in list(self.pending.items()):
+                    n = st.get("attempts", 0)
+                    backoff = min(SETTLE_RETRY_S * (2 ** n), SETTLE_BACKOFF_MAX_S)
+                    if now_t - st.get("last_try", 0.0) < backoff:
+                        continue
+                    st["last_try"] = now_t
+                    if await self.try_settle(coin, wts, st):
+                        del self.pending[(coin, wts)]
+                    else:
+                        st["attempts"] = n + 1
+                        if st["attempts"] > MAX_SETTLE_ATTEMPTS:
+                            write_row(coin, wts, {"kind": "settle_miss", "ts_ms": now_ms(),
+                                                  "coin": coin, "slug": st["slug"],
+                                                  "window_ts": wts, "attempts": st["attempts"]})
                             del self.pending[(coin, wts)]
-                        else:
-                            st["attempts"] += 1
-                            if st["attempts"] > MAX_SETTLE_ATTEMPTS:
-                                write_row(coin, wts, {"kind": "settle_miss", "ts_ms": now_ms(),
-                                                      "coin": coin, "slug": st["slug"],
-                                                      "window_ts": wts, "attempts": st["attempts"]})
-                                del self.pending[(coin, wts)]
-                # 5) 状态行
+
                 if time.time() - self.last_print > STATUS_PRINT_S:
                     self.last_print = time.time()
                     run_s = time.time() - self.t_start
@@ -516,14 +494,27 @@ class Collector:
                 break
             poll = POLL_SECONDS_BURST if (time.time() - ts) < BURST_SECONDS else POLL_SECONDS
             remain = max(1.0, poll * self.slow - (time.time() - t0))
-            while remain > 0 and not STOP:          # 分段睡，SIGTERM 后最多 1s 内退出
+            while remain > 0 and not STOP:
                 chunk = min(1.0, remain)
                 await asyncio.sleep(chunk)
                 remain -= chunk
 
-        # 收尾：窗口落 summary 并入待结算队列，再尽力补一次结算（失败不影响下次启动）
+        # ===== 收尾 =====
+        # 改动 1：先 finalize 当前窗口，然后等尾窗结束 + 60s 再尝试结算
         for w in list(self.windows.values()):
             self.finalize(w)
+
+        if self.pending:
+            last_end = max(wts + WINDOW_SECONDS for (_, wts) in self.pending)
+            wait_until = last_end + TAIL_SETTLE_WAIT_S
+            now = time.time()
+            if wait_until > now:
+                wait_s = wait_until - now
+                print(f"[collector] 收尾等待尾窗结算 {wait_s:.0f}s"
+                      f"（到 {datetime.datetime.fromtimestamp(wait_until):%H:%M:%S}）", flush=True)
+                while time.time() < wait_until and not STOP:
+                    await asyncio.sleep(1.0)
+
         for (coin, wts), st in list(self.pending.items()):
             try:
                 if await self.try_settle(coin, wts, st):
@@ -545,25 +536,16 @@ def make_exchange(proxy):
         import ccxt
     except ImportError:
         sys.exit("缺少 ccxt（需 >= 4.5.76 的 prediction 模块），请先安装：\n"
-                 "  pip3 install \"ccxt>=4.5.76\"\n"
-                 "本机请用 freqtrade 虚拟环境解释器：\n"
-                 r"  g:\pytest\factormining\freqtrade\.venv\Scripts\python.exe collect_poly_15m.py")
+                 "  pip3 install \"ccxt>=4.5.76\"")
     ex = P({"timeout": TIMEOUT_MS, "enableRateLimit": True})
     if proxy:
-        # 用 ccxt 原生 https_proxy（内部走 requests 的 proxies{'https'}），
-        # 由 requests 做 CONNECT 隧道；不要用 proxyUrl —— 那是浏览器端 CORS 中转前缀
-        # （会拼 URL + 补 Origin 头），且在 4.5.76 里与 check_conflicting_proxies 的
-        # `is not None` 判断冲突必抛 InvalidProxySettings。
         ex.https_proxy = proxy
     print(f"[collector] python={sys.version.split()[0]} ccxt={getattr(ccxt, '__version__', '?')} "
           f"proxy={proxy or 'direct'}", flush=True)
     return ex
 
 
-# ------------------------------ 启动自检 ------------------------------
 async def selfcheck(col):
-    """开局打一发 gamma + /book + /fee-rate：RTT / 点差 / 手续费一眼看通路是否可用。
-    返回 True=通路可用；False 只告警不退出（网络可能稍后恢复，主循环会持续重试并落 err）。"""
     ts = int(time.time()) // WINDOW_SECONDS * WINDOW_SECONDS
     coin = col.coins[0]
     m = None
@@ -572,8 +554,6 @@ async def selfcheck(col):
             m = await col._gamma_market(slug_for(coin, cand), coin, cand)
         except Exception as e:
             print(f"[selfcheck] gamma 请求失败：{type(e).__name__}: {e}", flush=True)
-            print("[selfcheck] 检查代理是否可用：墙外 VPS 应直连（去掉 --proxy）；"
-                  "墙内需 --proxy http://127.0.0.1:7890 或 export POLY_PROXY=...", flush=True)
             return False
         if m:
             ts = cand
@@ -601,12 +581,12 @@ async def selfcheck(col):
     lag = now_ms() - int(fnum(book.get("timestamp"), now_ms()))
     print(f"[selfcheck] clob OK  RTT={rtt}ms  bid={bids[0][0] if bids else None} "
           f"ask={asks[0][0] if asks else None} n_bid={len(bids)} n_ask={len(asks)} "
-          f"srv_ts_lag={lag}ms（>2000ms 说明中转在返回缓存）", flush=True)
+          f"srv_ts_lag={lag}ms", flush=True)
     try:
         fee = await col._call("clobPublicGetFeeRate", {"token_id": tok}, "clob/fee-rate")
         print(f"[selfcheck] fee-rate OK  {fee}", flush=True)
     except Exception as e:
-        print(f"[selfcheck] fee-rate 失败（不致命，采集继续）：{type(e).__name__}: {e}", flush=True)
+        print(f"[selfcheck] fee-rate 失败（不致命）：{type(e).__name__}: {e}", flush=True)
     print("[selfcheck] 通过 —— 通路可用，进入采集", flush=True)
     return True
 
@@ -641,10 +621,28 @@ def report(out_dir):
         samples = [r for r in rs if r["kind"] == "sample"]
         settles = [r for r in rs if r["kind"] == "settle"]
         errs = [r for r in rs if r["kind"] == "err"]
+
+        # 改动 3：剔窗——首采样偏移 > 60s 的窗口不纳入统计
+        first_sample_ms = {}
+        for r in samples:
+            key = (r["coin"], r["window_ts"])
+            if key not in first_sample_ms:
+                first_sample_ms[key] = r["ts_ms"]
+        bad_windows = set()
+        for (c2, wts), first_ms in first_sample_ms.items():
+            offset_s = first_ms / 1000.0 - wts
+            if offset_s > 60:
+                bad_windows.add((c2, wts))
+        n_before = len(samples)
+        samples = [r for r in samples if (r["coin"], r["window_ts"]) not in bad_windows]
+        n_dropped = n_before - len(samples)
+
         wins = sum(1 for s in settles if s.get("up_won"))
         print(f"\n--- {coin} ---")
-        print(f"窗口 {len(markets)}  采样 {len(samples)}  结算 {len(settles)}(up {wins}/down {len(settles)-wins})  "
-              f"失败请求 {len(errs)}")
+        print(f"窗口 {len(markets)}  采样 {len(samples)}"
+              + (f"（剔窗 -{n_dropped}）" if n_dropped else "")
+              + f"  结算 {len(settles)}(up {wins}/down {len(settles)-wins})  "
+                f"失败请求 {len(errs)}")
         if errs:
             print(f"  失败率 {len(errs)/max(1,len(errs)+len(samples)*2):.0%}"
                   f"  首条: {errs[0]['err'][:90]}")
@@ -664,9 +662,9 @@ def report(out_dir):
             if up.get("err"):
                 continue
             if up.get("bid") is not None and up.get("ask") is not None:
-                spreads.append(round((up["ask"] - up["bid"]) * 100, 3))     # ¢
+                spreads.append(round((up["ask"] - up["bid"]) * 100, 3))
             if up.get("srv_ts"):
-                srv_lag.append(ts_ms - up["srv_ts"])                        # 中转是否缓存/串味
+                srv_lag.append(ts_ms - up["srv_ts"])
             for tag in ("up", "down"):
                 bk = r.get(tag) or {}
                 if bk.get("err"):
@@ -674,7 +672,7 @@ def report(out_dir):
                 for q, name in Q_MAX_LIST:
                     d = (bk.get("ask_depth") or {}).get(str(q))
                     if not d:
-                        continue      # 该侧最优卖价高于 q_max -> 此侧信号不触发，不计入分母
+                        continue
                     fill_med.setdefault(name, []).append(d)
                     fill_frac.setdefault(name, []).append(1 if d >= MIN_FILL_SHARES else 0)
 
@@ -682,14 +680,14 @@ def report(out_dir):
         print(f"  点差(UP token, ¢): 中位 {med(ss)}  p25 {pct(ss,25)}  p75 {pct(ss,75)}  p90 {pct(ss,90)}  n={len(ss)}")
         print(f"  采集节奏(s): 中位间隔 {round(med(gaps),1) if gaps else None}  实际采样 {len(samples)} 条")
         if srv_lag:
-            print(f"  服务端时间戳滞后(ms): 中位 {med(srv_lag):.0f}  <- 远大于 2000 说明中转在返回缓存")
+            print(f"  服务端时间戳滞后(ms): 中位 {med(srv_lag):.0f}")
         if fee_bps_vals:
             print(f"  base_fee(bps): 取值 {sorted(set(fee_bps_vals))}"
                   f"  feesEnabled={sorted(set(bool(m.get('fees_enabled')) for m in markets))}")
         else:
             print("  base_fee: 未取到（/fee-rate 请求全部失败）")
-        fee_p50 = FEE_RATE_MAX * 0.5 * (0.5 * 0.5) ** 2      # 50¢ 处每股手续费（概率口径）
-        print(f"  50¢ 处封顶有效费率: {fee_p50*100:.2f}% 每股多付 {fee_p50*100:.2f}¢（正式口径见 docs fee 公式）")
+        fee_p50 = FEE_RATE_MAX * 0.5 * (0.5 * 0.5) ** 2
+        print(f"  50¢ 处封顶有效费率: {fee_p50*100:.2f}% 每股多付 {fee_p50*100:.2f}¢")
         print(f"  <=q_max 一侧 50 股可得性（仅统计最优卖价<=q_max 的可触发机会；UP/DOWN 两侧合计）:")
         for q, name in Q_MAX_LIST:
             f = fill_frac.get(name, [])
@@ -699,7 +697,6 @@ def report(out_dir):
             else:
                 print(f"    q_max={q} ({name}): 两侧均未触及（0 机会 / {len(samples)} 条采样）")
 
-        # 判据（Step 0 go/no-go）
         m_spread = med(ss)
         f_main = fill_frac.get("main", [])
         frac_main = sum(f_main) / len(f_main) if f_main else 0.0
@@ -732,14 +729,12 @@ def main():
     global OUT_DIR
     ap = argparse.ArgumentParser(description="Polymarket 15min 盘口采集器（Step 0）")
     ap.add_argument("--coins", default=",".join(COINS_DEFAULT), help="币种，逗号分隔")
-    ap.add_argument("--proxy", default=None,
-                    help="HTTP 代理（http://host:port）；空串=显式直连；不传=按 $POLY_PROXY/"
-                         "$HTTPS_PROXY/平台默认")
+    ap.add_argument("--proxy", default=None, help="HTTP 代理；空串=显式直连；不传=按环境变量")
     ap.add_argument("--run-for", type=float, default=0, help="运行秒数，0=常驻")
     ap.add_argument("--report", action="store_true", help="只读已落盘数据出报告，不联网")
-    ap.add_argument("--out", default=OUT_DIR, help="数据目录（默认 $POLY_OUT 或脚本同级 poly_data/）")
-    ap.add_argument("--bust-cache", action="store_true", help="给目标 URL 加 _nocache 参数，防中转缓存")
-    ap.add_argument("--skip-selfcheck", action="store_true", help="跳过启动自检（少发 3 个请求）")
+    ap.add_argument("--out", default=OUT_DIR, help="数据目录")
+    ap.add_argument("--bust-cache", action="store_true", help="给目标 URL 加 _nocache 参数")
+    ap.add_argument("--skip-selfcheck", action="store_true", help="跳过启动自检")
     args = ap.parse_args()
     args.coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     args.proxy = resolve_proxy(args.proxy)
